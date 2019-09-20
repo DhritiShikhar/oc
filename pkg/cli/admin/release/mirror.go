@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"sort"
 	"strings"
 	"sync"
@@ -21,8 +22,8 @@ import (
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog"
-	kcmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
-	"k8s.io/kubernetes/pkg/kubectl/util/templates"
+	kcmdutil "k8s.io/kubectl/pkg/cmd/util"
+	"k8s.io/kubectl/pkg/util/templates"
 	"sigs.k8s.io/yaml"
 
 	imagev1 "github.com/openshift/api/image/v1"
@@ -83,6 +84,8 @@ func NewMirror(f kcmdutil.Factory, parentName string, streams genericclioptions.
 	flags.StringVar(&o.From, "from", o.From, "Image containing the release payload.")
 	flags.StringVar(&o.To, "to", o.To, "An image repository to push to.")
 	flags.StringVar(&o.ToImageStream, "to-image-stream", o.ToImageStream, "An image stream to tag images into.")
+	flags.StringVar(&o.ToDir, "to-dir", o.ToDir, "A directory to export images to. Requires the 'skopeo' command.")
+	flags.BoolVar(&o.ToMirror, "to-mirror", o.ToMirror, "Output the mirror mappings instead of mirroring.")
 	flags.BoolVar(&o.DryRun, "dry-run", o.DryRun, "Display information about the mirror without actually executing it.")
 
 	flags.BoolVar(&o.SkipRelease, "skip-release-image", o.SkipRelease, "Do not push the release image.")
@@ -101,8 +104,12 @@ type MirrorOptions struct {
 	To            string
 	ToImageStream string
 
+	// modifies the targets
 	ToRelease   string
 	SkipRelease bool
+
+	ToMirror bool
+	ToDir    string
 
 	DryRun                        bool
 	PrintImageContentInstructions bool
@@ -144,14 +151,35 @@ func (o *MirrorOptions) Complete(cmd *cobra.Command, f kcmdutil.Factory, args []
 }
 
 const replaceComponentMarker = "X-X-X-X-X-X-X"
+const replaceVersionMarker = "V-V-V-V-V-V-V"
 
 func (o *MirrorOptions) Run() error {
 	if len(o.From) == 0 && o.ImageStream == nil {
 		return fmt.Errorf("must specify a release image with --from")
 	}
 
-	if (len(o.To) == 0) == (len(o.ToImageStream) == 0) {
+	targets := 0
+	outputs := 0
+	if len(o.To) > 0 {
+		outputs++
+	}
+	if len(o.ToImageStream) > 0 {
+		outputs++
+	}
+	if len(o.ToDir) > 0 {
+		if outputs == 0 {
+			outputs++
+		}
+		targets++
+	}
+	if o.ToMirror {
+		targets++
+	}
+	if outputs != 1 {
 		return fmt.Errorf("must specify an image repository or image stream to mirror the release to")
+	}
+	if targets > 1 {
+		return fmt.Errorf("must specify either --to-mirror or --to-dir")
 	}
 
 	if o.SkipRelease && len(o.ToRelease) > 0 {
@@ -171,15 +199,24 @@ func (o *MirrorOptions) Run() error {
 	} else {
 		dst = o.To
 	}
+	if len(dst) == 0 {
+		dst = "local/image"
+	}
 
+	var version string
 	if strings.Contains(dst, "${component}") {
 		format := strings.Replace(dst, "${component}", replaceComponentMarker, -1)
+		format = strings.Replace(format, "${version}", replaceVersionMarker, -1)
 		dstRef, err := mirror.ParseMirrorReference(format)
 		if err != nil {
 			return fmt.Errorf("--to must be a valid image reference: %v", err)
 		}
 		targetFn = func(name string) mirror.MirrorReference {
+			if len(name) == 0 {
+				name = "release"
+			}
 			value := strings.Replace(dst, "${component}", name, -1)
+			value = strings.Replace(value, "${version}", version, -1)
 			ref, err := mirror.ParseMirrorReference(value)
 			if err != nil {
 				klog.Fatalf("requested component %q could not be injected into %s: %v", name, dst, err)
@@ -199,7 +236,11 @@ func (o *MirrorOptions) Run() error {
 		}
 		targetFn = func(name string) mirror.MirrorReference {
 			copied := ref
-			copied.Tag = name
+			if len(name) > 0 {
+				copied.Tag = fmt.Sprintf("%s-%s", version, name)
+			} else {
+				copied.Tag = version
+			}
 			return copied
 		}
 		hasPrefix = true
@@ -245,6 +286,7 @@ func (o *MirrorOptions) Run() error {
 			fmt.Fprintf(o.ErrOut, "warning: %v\n", err)
 		}
 	}
+	version = is.Name
 
 	var mappings []mirror.Mapping
 	if len(o.From) > 0 && !o.SkipRelease {
@@ -265,7 +307,7 @@ func (o *MirrorOptions) Run() error {
 				Name:        o.ToRelease,
 			})
 		} else if !o.SkipRelease {
-			dstRef := targetFn("release")
+			dstRef := targetFn("")
 			mappings = append(mappings, mirror.Mapping{
 				Source:      srcRef,
 				Type:        dstRef.Type(),
@@ -312,6 +354,42 @@ func (o *MirrorOptions) Run() error {
 
 	if len(mappings) == 0 {
 		fmt.Fprintf(o.ErrOut, "warning: Release image contains no image references - is this a valid release?\n")
+	}
+
+	if len(o.ToDir) > 0 {
+		if err := os.MkdirAll(o.ToDir, 0755); err != nil {
+			return err
+		}
+		path := "skopeo"
+		if !o.DryRun {
+			binary, err := exec.LookPath(path)
+			if err != nil {
+				return fmt.Errorf("unable to find the 'skopeo' executable on your path, --to-dir is not available")
+			}
+			path = binary
+		}
+
+		for _, mapping := range mappings {
+			args := []string{"--insecure-policy", "copy", fmt.Sprintf("docker://%s", mapping.Source.Exact()), fmt.Sprintf("docker-archive:%s/%s", o.ToDir, mapping.Destination.Tag)}
+			if o.DryRun {
+				fmt.Fprintln(o.Out, strings.Join(append([]string{path}, args...), " "))
+				continue
+			}
+			cmd := exec.Command(path, args...)
+			cmd.Stdout = o.Out
+			cmd.Stderr = o.ErrOut
+			if err := cmd.Run(); err != nil {
+				return fmt.Errorf("failed to copy %s to disk", mapping.Name)
+			}
+		}
+		return nil
+	}
+
+	if o.ToMirror {
+		for _, mapping := range mappings {
+			fmt.Fprintf(o.Out, "%s %s\n", mapping.Source.Exact(), mapping.Destination.Exact())
+		}
+		return nil
 	}
 
 	if len(o.ToImageStream) > 0 {
@@ -447,7 +525,7 @@ func (o *MirrorOptions) Run() error {
 
 	to := o.ToRelease
 	if len(to) == 0 {
-		to = targetFn("release").String()
+		to = targetFn("").Exact()
 	}
 	if hasPrefix {
 		fmt.Fprintf(o.Out, "\nSuccess\nUpdate image:  %s\nMirror prefix: %s\n", to, o.To)
@@ -463,7 +541,7 @@ func (o *MirrorOptions) Run() error {
 	return nil
 }
 
-// printImageContentInstructions provides exapmles to the user for using the new repository mirror
+// printImageContentInstructions provides examples to the user for using the new repository mirror
 // https://github.com/openshift/installer/blob/master/docs/dev/alternative_release_image_sources.md
 func printImageContentInstructions(out io.Writer, from, to string, repositories map[string]struct{}) error {
 	type installConfigSubsection struct {

@@ -3,15 +3,15 @@ package admin
 import (
 	"fmt"
 
-	"k8s.io/kubernetes/pkg/kubectl/cmd/certificates"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/taint"
+	"k8s.io/kubectl/pkg/cmd/certificates"
+	"k8s.io/kubectl/pkg/cmd/taint"
 
 	"github.com/spf13/cobra"
 
 	"k8s.io/cli-runtime/pkg/genericclioptions"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/drain"
-	kcmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
-	ktemplates "k8s.io/kubernetes/pkg/kubectl/util/templates"
+	"k8s.io/kubectl/pkg/cmd/drain"
+	kcmdutil "k8s.io/kubectl/pkg/cmd/util"
+	ktemplates "k8s.io/kubectl/pkg/util/templates"
 
 	"github.com/openshift/oc/pkg/cli/admin/buildchain"
 	"github.com/openshift/oc/pkg/cli/admin/cert"
@@ -21,6 +21,7 @@ import (
 	"github.com/openshift/oc/pkg/cli/admin/createlogintemplate"
 	"github.com/openshift/oc/pkg/cli/admin/createproviderselectiontemplate"
 	"github.com/openshift/oc/pkg/cli/admin/groups"
+	"github.com/openshift/oc/pkg/cli/admin/inspect"
 	"github.com/openshift/oc/pkg/cli/admin/migrate"
 	migrateetcd "github.com/openshift/oc/pkg/cli/admin/migrate/etcd"
 	migrateimages "github.com/openshift/oc/pkg/cli/admin/migrate/images"
@@ -63,6 +64,7 @@ func NewCommandAdmin(name, fullName string, f kcmdutil.Factory, streams genericc
 				upgrade.New(f, fullName, streams),
 				top.NewCommandTop(top.TopRecommendedName, fullName+" "+top.TopRecommendedName, f, streams),
 				mustgather.NewMustGatherCommand(f, streams),
+				inspect.NewCmdInspect(streams, fullName),
 			},
 		},
 		{

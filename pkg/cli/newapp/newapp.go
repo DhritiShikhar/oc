@@ -31,12 +31,12 @@ import (
 	"k8s.io/client-go/kubernetes"
 	corev1typedclient "k8s.io/client-go/kubernetes/typed/core/v1"
 	restclient "k8s.io/client-go/rest"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/logs"
-	kcmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
-	"k8s.io/kubernetes/pkg/kubectl/generate"
-	"k8s.io/kubernetes/pkg/kubectl/polymorphichelpers"
-	"k8s.io/kubernetes/pkg/kubectl/scheme"
-	"k8s.io/kubernetes/pkg/kubectl/util/templates"
+	"k8s.io/kubectl/pkg/cmd/logs"
+	kcmdutil "k8s.io/kubectl/pkg/cmd/util"
+	"k8s.io/kubectl/pkg/generate"
+	"k8s.io/kubectl/pkg/polymorphichelpers"
+	"k8s.io/kubectl/pkg/scheme"
+	"k8s.io/kubectl/pkg/util/templates"
 
 	appsv1 "github.com/openshift/api/apps/v1"
 	"github.com/openshift/api/build"
@@ -369,7 +369,18 @@ func (o *AppOptions) RunNewApp() error {
 	if len(result.Name) > 0 {
 		// only set the computed implicit "app" label on objects if no object we've produced
 		// already has the "app" label.
-		appLabel := map[string]string{"app": result.Name}
+		appLabel := map[string]string{
+			"app":                         result.Name,
+			"app.kubernetes.io/instance":  result.Name,
+			"app.kubernetes.io/component": result.Name,
+		}
+
+		for _, name := range o.Config.ImageStreams {
+			if name != "" {
+				appLabel["app.kubernetes.io/name"] = name
+			}
+		}
+
 		hasAppLabel, err := hasLabel(appLabel, result)
 		if err != nil {
 			return err
@@ -792,13 +803,6 @@ func addObjectLabels(obj runtime.Object, labels labels.Set) error {
 	}
 	accessor.SetLabels(metaLabels)
 
-	switch objType := obj.(type) {
-	case *appsv1.DeploymentConfig:
-		if err := addDeploymentConfigNestedLabels(objType, labels); err != nil {
-			return fmt.Errorf("unable to add nested labels to %s/%s: %v", obj.GetObjectKind().GroupVersionKind(), accessor.GetName(), err)
-		}
-	}
-
 	return nil
 }
 
@@ -806,7 +810,7 @@ func SetLabels(labels map[string]string, result *newcmd.AppResult) error {
 	for _, object := range result.List.Items {
 		err := addObjectLabels(object, labels)
 		if err != nil {
-			return fmt.Errorf("failed to add annotation to object of type %q, this resource type is probably unsupported by your client version.", object.GetObjectKind().GroupVersionKind())
+			return fmt.Errorf("failed to add label to object of type %q, this resource type is probably unsupported by your client version.", object.GetObjectKind().GroupVersionKind())
 		}
 	}
 	return nil

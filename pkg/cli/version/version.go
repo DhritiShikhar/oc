@@ -14,10 +14,10 @@ import (
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog"
-	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
-	kversion "k8s.io/kubernetes/pkg/kubectl/cmd/version"
-	"k8s.io/kubernetes/pkg/kubectl/util/i18n"
-	"k8s.io/kubernetes/pkg/kubectl/util/templates"
+	cmdutil "k8s.io/kubectl/pkg/cmd/util"
+	kversion "k8s.io/kubectl/pkg/cmd/version"
+	"k8s.io/kubectl/pkg/util/i18n"
+	"k8s.io/kubectl/pkg/util/templates"
 
 	configv1 "github.com/openshift/api/config/v1"
 	configv1client "github.com/openshift/client-go/config/clientset/versioned/typed/config/v1"
@@ -26,7 +26,8 @@ import (
 
 type Version struct {
 	kversion.Version
-	OpenShiftVersion string `json:"openshiftVersion,omitempty"`
+	ReleaseClientVersion string `json:"releaseClientVersion,omitempty"`
+	OpenShiftVersion     string `json:"openshiftVersion,omitempty"`
 }
 
 var (
@@ -43,7 +44,7 @@ var (
 )
 
 type VersionOptions struct {
-	kversion.VersionOptions
+	kversion.Options
 	oClient         configv1client.ClusterOperatorsGetter
 	discoveryClient discovery.CachedDiscoveryInterface
 
@@ -108,7 +109,13 @@ func (o *VersionOptions) Complete(f cmdutil.Factory, cmd *cobra.Command) error {
 // Run is copied from upstream version command, with added OpenShift server version logic
 func (o *VersionOptions) Run() error {
 	var versionInfo Version
-	clientVersion := version.Get()
+	clientVersion, reportedVersion, err := version.ExtractVersion()
+	if err != nil {
+		return err
+	}
+	if len(reportedVersion) != 0 {
+		versionInfo.ReleaseClientVersion = reportedVersion
+	}
 	versionInfo.ClientVersion = &clientVersion
 
 	var serverErr error
@@ -145,7 +152,11 @@ func (o *VersionOptions) Run() error {
 	switch o.Output {
 	case "":
 		if versionInfo.ClientVersion != nil {
-			fmt.Fprintf(o.Out, "Client Version: %s\n", clientVersion.GitVersion)
+			if len(versionInfo.ReleaseClientVersion) != 0 {
+				fmt.Fprintf(o.Out, "Client Version: %s\n", reportedVersion)
+			} else {
+				fmt.Fprintf(o.Out, "Client Version: %s\n", clientVersion.GitVersion)
+			}
 		}
 		if len(versionInfo.OpenShiftVersion) != 0 {
 			fmt.Fprintf(o.Out, "Server Version: %s\n", fmt.Sprintf("%s", versionInfo.OpenShiftVersion))

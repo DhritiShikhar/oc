@@ -31,8 +31,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/duration"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
-	kcmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
-	"k8s.io/kubernetes/pkg/kubectl/util/templates"
+	kcmdutil "k8s.io/kubectl/pkg/cmd/util"
+	"k8s.io/kubectl/pkg/util/templates"
 
 	imageapi "github.com/openshift/api/image/v1"
 	configv1client "github.com/openshift/client-go/config/clientset/versioned"
@@ -100,6 +100,7 @@ func NewInfo(f kcmdutil.Factory, parentName string, streams genericclioptions.IO
 
 	flags.BoolVar(&o.ShowContents, "contents", o.ShowContents, "Display the contents of a release.")
 	flags.BoolVar(&o.ShowCommit, "commits", o.ShowCommit, "Display information about the source an image was created with.")
+	flags.BoolVar(&o.ShowCommitURL, "commit-urls", o.ShowCommitURL, "Display a link (if possible) to the source code.")
 	flags.BoolVar(&o.ShowPullSpec, "pullspecs", o.ShowPullSpec, "Display the pull spec of each image instead of the digest.")
 	flags.BoolVar(&o.ShowSize, "size", o.ShowSize, "Display the size of each image including overlap.")
 	flags.StringVar(&o.ImageFor, "image-for", o.ImageFor, "Print the pull spec of the specified image or an error if it does not exist.")
@@ -121,6 +122,7 @@ type InfoOptions struct {
 	IncludeImages bool
 	ShowContents  bool
 	ShowCommit    bool
+	ShowCommitURL bool
 	ShowPullSpec  bool
 	ShowSize      bool
 	Verify        bool
@@ -177,6 +179,9 @@ func (o *InfoOptions) Validate() error {
 	if o.ShowCommit {
 		count++
 	}
+	if o.ShowCommitURL {
+		count++
+	}
 	if o.ShowPullSpec {
 		count++
 	}
@@ -190,7 +195,7 @@ func (o *InfoOptions) Validate() error {
 		count++
 	}
 	if count > 1 {
-		return fmt.Errorf("only one of --commits, --pullspecs, --contents, --size, --verify may be specified")
+		return fmt.Errorf("only one of --commits, --commit-urls, --pullspecs, --contents, --size, --verify may be specified")
 	}
 	if len(o.ImageFor) > 0 && len(o.Output) > 0 {
 		return fmt.Errorf("--output and --image-for may not both be specified")
@@ -353,7 +358,7 @@ func (o *InfoOptions) describeImage(release *ReleaseInfo) error {
 		fmt.Fprintln(o.Out, spec)
 		return nil
 	}
-	return describeReleaseInfo(o.Out, release, o.ShowCommit, o.ShowPullSpec, o.ShowSize)
+	return describeReleaseInfo(o.Out, release, o.ShowCommit, o.ShowCommitURL, o.ShowPullSpec, o.ShowSize)
 }
 
 func findImageSpec(image *imageapi.ImageStream, tagName, imageName string) (string, error) {
@@ -904,7 +909,7 @@ func codeChanged(from, to *imageapi.TagReference) bool {
 	return len(oldCommit) > 0 && len(newCommit) > 0 && oldCommit != newCommit
 }
 
-func describeReleaseInfo(out io.Writer, release *ReleaseInfo, showCommit, pullSpec, showSize bool) error {
+func describeReleaseInfo(out io.Writer, release *ReleaseInfo, showCommit, showCommitURL, pullSpec, showSize bool) error {
 	w := tabwriter.NewWriter(out, 0, 4, 1, ' ', 0)
 	defer w.Flush()
 	now := time.Now()
@@ -1042,6 +1047,22 @@ func describeReleaseInfo(out io.Writer, release *ReleaseInfo, showCommit, pullSp
 				fmt.Fprintf(w, "  %s across %d layers, %d different base images\n", units.HumanSize(float64(totalSize)), len(layerCount), len(baseLayer))
 			} else {
 				fmt.Fprintf(w, "  %s across %d layers\n", units.HumanSize(float64(totalSize)), len(layerCount))
+			}
+
+		case showCommitURL:
+			fmt.Fprintf(w, "  NAME\tURL\t\n")
+			for _, tag := range release.References.Spec.Tags {
+				if tag.From == nil || tag.From.Kind != "DockerImage" {
+					continue
+				}
+				var url string
+				u, err := sourceLocationAsURL(tag.Annotations[annotationBuildSourceLocation])
+				if err == nil && u.Host == "github.com" {
+					url = fmt.Sprintf("https://github.com%s/commit/%s", u.Path, tag.Annotations[annotationBuildSourceCommit])
+				} else {
+					url = fmt.Sprintf("%s %s", tag.Annotations[annotationBuildSourceLocation], tag.Annotations[annotationBuildSourceCommit])
+				}
+				fmt.Fprintf(w, "  %s\t%s\n", tag.Name, url)
 			}
 
 		case showCommit:
@@ -1228,14 +1249,19 @@ func describeChangelog(out, errOut io.Writer, diff *ReleaseDiff, dir string) err
 					suffix = commit.Commit[:8]
 				}
 				switch {
-				case commit.Bug > 0:
-					fmt.Fprintf(out,
-						"* [Bug %d](%s): %s %s\n",
-						commit.Bug,
-						fmt.Sprintf("https://bugzilla.redhat.com/show_bug.cgi?id=%d", commit.Bug),
-						commit.Subject,
-						suffix,
-					)
+				case len(commit.Bugs) > 0:
+					for i, bug := range commit.Bugs {
+						if i == 0 {
+							fmt.Fprintf(out, "* [Bug %d](%s)", bug, fmt.Sprintf("https://bugzilla.redhat.com/show_bug.cgi?id=%d", bug))
+						} else {
+							fmt.Fprintf(out, ", [%d](%s)", bug, fmt.Sprintf("https://bugzilla.redhat.com/show_bug.cgi?id=%d", bug))
+						}
+						fmt.Fprintf(out,
+							": %s %s\n",
+							commit.Subject,
+							suffix,
+						)
+					}
 				default:
 					fmt.Fprintf(out,
 						"* %s %s\n",
@@ -1275,10 +1301,10 @@ func describeBugs(out, errOut io.Writer, diff *ReleaseDiff, dir string, format s
 			continue
 		}
 		for _, commit := range commits {
-			if commit.Bug == 0 {
+			if len(commit.Bugs) == 0 {
 				continue
 			}
-			bugIDs.Insert(commit.Bug)
+			bugIDs.Insert(commit.Bugs...)
 		}
 	}
 
